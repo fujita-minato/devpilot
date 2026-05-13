@@ -12,6 +12,8 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    ".claude/**",
+    ".codex/**",
     // Local sanity / one-off runner scripts (not shipped, not imported)
     "scripts/**",
   ]),

@@ -54,7 +54,7 @@ export async function GET() {
       .all();
     const statsMap = new Map(sessionStats.map((s) => [s.projectId, s]));
 
-    const result: ProjectWithStats[] = allProjects.map((p) => {
+    const result: ProjectWithStats[] = allProjects.filter((p) => statsMap.has(p.id)).map((p) => {
       const stats = statsMap.get(p.id);
       return {
         id: p.id,

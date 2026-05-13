@@ -49,3 +49,7 @@ devpilot.db-wal
 
 # local design scratchpads (not for public repo)
 DESIGN.md
+
+# local AI tool scratch/worktree state
+.claude/
+.codex/

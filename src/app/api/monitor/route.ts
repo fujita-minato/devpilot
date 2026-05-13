@@ -215,7 +215,9 @@ export async function GET() {
 
     const now = Date.now();
 
-    const result: MonitorProject[] = allProjects.map((p) => {
+    const sessionProjectIds = new Set(allSessions.map((session) => session.projectId).filter(Boolean));
+
+    const result: MonitorProject[] = allProjects.filter((p) => sessionProjectIds.has(p.id)).map((p) => {
       const projectSessions = allSessions.filter((s) => s.projectId === p.id);
 
       // Token totals

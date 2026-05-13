@@ -3,15 +3,17 @@
  * 解析 ~/.claude/projects/ 下的 JSONL session 数据，写入 SQLite
  */
 
-import { readdirSync, statSync, createReadStream } from 'fs';
-import { join } from 'path';
+import { readdirSync, statSync, createReadStream, type Dirent } from 'fs';
+import { join, relative } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { createHash } from 'crypto';
+import { and, eq, inArray, notInArray } from 'drizzle-orm';
 import { db } from '../db';
-import { projects, sessions } from '../schema';
+import { codeAuthorship, decisions, projects, sessions } from '../schema';
 import { inferStage } from './stage-inferrer';
 import { calculateCost } from '../pricing';
+import { normalizeProjectPath } from './project-path';
 
 const CLAUDE_PROJECTS_DIR = join(homedir(), '.claude', 'projects');
 
@@ -44,6 +46,63 @@ interface ParsedSession {
   toolsUsed: string[];
   summary: string;
   model: string | null;      // P8: 第一次看到的 model id，同一 session 内通常不变
+}
+
+interface ProcessProjectResult {
+  projectCount: number;
+  sessionCount: number;
+  sessionIds: string[];
+}
+
+function emptyResult(): ProcessProjectResult {
+  return { projectCount: 0, sessionCount: 0, sessionIds: [] };
+}
+
+function findJsonlFiles(dir: string): string[] {
+  const files: string[] = [];
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+
+  for (const entry of entries) {
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...findJsonlFiles(fullPath));
+    } else if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+      files.push(fullPath);
+    }
+  }
+
+  return files;
+}
+
+function sessionIdFromPath(projectDir: string, jsonlPath: string): string {
+  const relPath = relative(projectDir, jsonlPath).replace(/\.jsonl$/, '');
+  return relPath.split('/').join(':');
+}
+
+function deleteStaleClaudeSessions(parsedIds: string[]) {
+  const staleRows = parsedIds.length > 0
+    ? db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(and(eq(sessions.source, 'claude'), notInArray(sessions.id, parsedIds)))
+      .all()
+    : db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.source, 'claude'))
+      .all();
+
+  const staleIds = staleRows.map((row) => row.id);
+  if (staleIds.length === 0) return;
+
+  db.delete(decisions).where(inArray(decisions.sessionId, staleIds)).run();
+  db.delete(codeAuthorship).where(inArray(codeAuthorship.sessionId, staleIds)).run();
+  db.delete(sessions).where(inArray(sessions.id, staleIds)).run();
 }
 
 // 流式解析 JSONL 文件（避免大文件 OOM）
@@ -144,24 +203,15 @@ async function parseJsonlSession(
 async function processProjectDir(
   dirName: string,
   fullDirPath: string,
-): Promise<number> {
-  // 找出所有 .jsonl 文件（每个对应一个 session）
-  let files: string[];
-  try {
-    files = readdirSync(fullDirPath);
-  } catch {
-    return 0;
-  }
-
-  const jsonlFiles = files.filter((f) => f.endsWith('.jsonl'));
-  if (jsonlFiles.length === 0) return 0;
+): Promise<ProcessProjectResult> {
+  const jsonlFiles = findJsonlFiles(fullDirPath);
+  if (jsonlFiles.length === 0) return emptyResult();
 
   // 并行解析所有 JSONL 文件（IO 密集，可以并发）
   const tempId = pathToId(dirNameToPath(dirName));
   const results = await Promise.allSettled(
-    jsonlFiles.map((jsonlFile) => {
-      const sessionId = jsonlFile.replace('.jsonl', '');
-      const jsonlPath = join(fullDirPath, jsonlFile);
+    jsonlFiles.map((jsonlPath) => {
+      const sessionId = sessionIdFromPath(fullDirPath, jsonlPath);
       return parseJsonlSession(jsonlPath, sessionId, tempId);
     }),
   );
@@ -175,115 +225,132 @@ async function processProjectDir(
     }
   }
 
-  if (parsedSessions.length === 0) return 0;
+  if (parsedSessions.length === 0) return emptyResult();
 
-  // 用 JSONL 里的真实 cwd 作为项目路径（避免目录名反推错误）
-  const realCwd = parsedSessions.find((s) => s.cwd)?.cwd ?? null;
-  const projectPath = realCwd ?? dirNameToPath(dirName);
-  const projectId = pathToId(projectPath);
-  const projectName = pathToName(projectPath);
-
-  let latestActivity = 0;
-  let latestBranch: string | null = null;
-  let latestSession: ParsedSession | null = null;
-
+  const sessionsByPath = new Map<string, ParsedSession[]>();
   for (const parsed of parsedSessions) {
-    if (parsed.startedAt && parsed.startedAt > latestActivity) {
-      latestActivity = parsed.startedAt;
-      latestSession = parsed;
-    }
-    if (parsed.gitBranch) {
-      latestBranch = parsed.gitBranch;
-    }
+    const projectPath = normalizeProjectPath(parsed.cwd ?? dirNameToPath(dirName));
+    const list = sessionsByPath.get(projectPath) ?? [];
+    list.push(parsed);
+    sessionsByPath.set(projectPath, list);
   }
 
-  // 从最近 session 推断 project stage（传入 lastActive 用于休眠判断）
-  const projectStage = inferStage(
-    latestSession?.gitBranch ?? latestBranch,
-    latestSession?.summary ?? '',
-    latestActivity > 0 ? latestActivity : null,
-  );
+  let projectCount = 0;
+  let sessionCount = 0;
 
-  // ★ 先 upsert project（外键约束要求 project 先存在）
-  db.insert(projects).values({
-    id: projectId,
-    name: projectName,
-    path: projectPath,
-    branch: latestBranch,
-    lastActive: latestActivity > 0 ? latestActivity : null,
-    stage: projectStage,
-  }).onConflictDoUpdate({
-    target: projects.id,
-    set: {
+  for (const [projectPath, projectSessions] of sessionsByPath) {
+    const projectId = pathToId(projectPath);
+    const projectName = pathToName(projectPath);
+
+    let latestActivity = 0;
+    let latestBranch: string | null = null;
+    let latestSession: ParsedSession | null = null;
+
+    for (const parsed of projectSessions) {
+      if (parsed.startedAt && parsed.startedAt > latestActivity) {
+        latestActivity = parsed.startedAt;
+        latestSession = parsed;
+      }
+      if (parsed.gitBranch) {
+        latestBranch = parsed.gitBranch;
+      }
+    }
+
+    // 从最近 session 推断 project stage（传入 lastActive 用于休眠判断）
+    const projectStage = inferStage(
+      latestSession?.gitBranch ?? latestBranch,
+      latestSession?.summary ?? '',
+      latestActivity > 0 ? latestActivity : null,
+    );
+
+    // ★ 先 upsert project（外键约束要求 project 先存在）
+    db.insert(projects).values({
+      id: projectId,
       name: projectName,
       path: projectPath,
       branch: latestBranch,
-      lastActive: latestActivity > 0 ? latestActivity : undefined,
+      lastActive: latestActivity > 0 ? latestActivity : null,
       stage: projectStage,
-    },
-  }).run();
+    }).onConflictDoUpdate({
+      target: projects.id,
+      set: {
+        name: projectName,
+        path: projectPath,
+        branch: latestBranch,
+        lastActive: latestActivity > 0 ? latestActivity : undefined,
+        stage: projectStage,
+      },
+    }).run();
 
-  // 再 upsert sessions（project 已存在，FK 不会失败）
-  for (const parsed of parsedSessions) {
-    try {
-      // Duration: endedAt - startedAt，但 cap 在 4 小时
-      // JSONL 里如果用户隔天回来继续，间隔会非常大，不代表真实工作时长
-      const MAX_SESSION_SECS = 4 * 3600; // 4h
-      const rawDuration =
-        parsed.startedAt && parsed.endedAt && parsed.endedAt > parsed.startedAt
-          ? Math.round((parsed.endedAt - parsed.startedAt) / 1000)
+    // 再 upsert sessions（project 已存在，FK 不会失败）
+    for (const parsed of projectSessions) {
+      try {
+        // Duration: endedAt - startedAt，但 cap 在 4 小时
+        // JSONL 里如果用户隔天回来继续，间隔会非常大，不代表真实工作时长
+        const MAX_SESSION_SECS = 4 * 3600; // 4h
+        const rawDuration =
+          parsed.startedAt && parsed.endedAt && parsed.endedAt > parsed.startedAt
+            ? Math.round((parsed.endedAt - parsed.startedAt) / 1000)
+            : null;
+        const duration = rawDuration !== null
+          ? Math.min(rawDuration, MAX_SESSION_SECS)
           : null;
-      const duration = rawDuration !== null
-        ? Math.min(rawDuration, MAX_SESSION_SECS)
-        : null;
 
-      const costUsd = calculateCost(parsed.model, {
-        input: parsed.tokensIn,
-        output: parsed.tokensOut,
-        cacheRead: parsed.tokensCacheRead,
-        cacheCreate: parsed.tokensCacheCreate,
-      });
+        const costUsd = calculateCost(parsed.model, {
+          input: parsed.tokensIn,
+          output: parsed.tokensOut,
+          cacheRead: parsed.tokensCacheRead,
+          cacheCreate: parsed.tokensCacheCreate,
+        });
 
-      db.insert(sessions).values({
-        id: parsed.id,
-        projectId: projectId,
-        source: 'claude',
-        startedAt: parsed.startedAt,
-        summary: parsed.summary,
-        tokensIn: parsed.tokensIn,
-        tokensOut: parsed.tokensOut,
-        tokensCacheRead: parsed.tokensCacheRead,
-        tokensCacheCreate: parsed.tokensCacheCreate,
-        toolsUsed: JSON.stringify(parsed.toolsUsed),
-        trackId: null,
-        gitBranch: parsed.gitBranch,
-        cwd: parsed.cwd,
-        duration,
-        model: parsed.model,
-        costUsd,
-      }).onConflictDoUpdate({
-        target: sessions.id,
-        set: {
+        db.insert(sessions).values({
+          id: parsed.id,
           projectId: projectId,
+          source: 'claude',
+          startedAt: parsed.startedAt,
+          summary: parsed.summary,
           tokensIn: parsed.tokensIn,
           tokensOut: parsed.tokensOut,
           tokensCacheRead: parsed.tokensCacheRead,
           tokensCacheCreate: parsed.tokensCacheCreate,
           toolsUsed: JSON.stringify(parsed.toolsUsed),
+          trackId: null,
           gitBranch: parsed.gitBranch,
           cwd: parsed.cwd,
-          summary: parsed.summary,
           duration,
           model: parsed.model,
           costUsd,
-        },
-      }).run();
-    } catch (err) {
-      console.error(`[claude-adapter] failed to insert session ${parsed.id}:`, err);
+        }).onConflictDoUpdate({
+          target: sessions.id,
+          set: {
+            projectId: projectId,
+            tokensIn: parsed.tokensIn,
+            tokensOut: parsed.tokensOut,
+            tokensCacheRead: parsed.tokensCacheRead,
+            tokensCacheCreate: parsed.tokensCacheCreate,
+            toolsUsed: JSON.stringify(parsed.toolsUsed),
+            gitBranch: parsed.gitBranch,
+            cwd: parsed.cwd,
+            summary: parsed.summary,
+            duration,
+            model: parsed.model,
+            costUsd,
+          },
+        }).run();
+      } catch (err) {
+        console.error(`[claude-adapter] failed to insert session ${parsed.id}:`, err);
+      }
     }
+
+    projectCount++;
+    sessionCount += projectSessions.length;
   }
 
-  return parsedSessions.length;
+  return {
+    projectCount,
+    sessionCount,
+    sessionIds: parsedSessions.map((session) => session.id),
+  };
 }
 
 // 全量扫描入口
@@ -314,14 +381,18 @@ export async function ingestClaude(): Promise<{ projectCount: number; sessionCou
 
   let processedProjects = 0;
   let processedSessions = 0;
+  const parsedIds: string[] = [];
   for (const r of results) {
-    if (r.status === 'fulfilled' && r.value > 0) {
-      processedProjects++;
-      processedSessions += r.value;
+    if (r.status === 'fulfilled') {
+      processedProjects += r.value.projectCount;
+      processedSessions += r.value.sessionCount;
+      parsedIds.push(...r.value.sessionIds);
     } else if (r.status === 'rejected') {
       console.error('[claude-adapter] project processing failed:', r.reason);
     }
   }
+
+  deleteStaleClaudeSessions([...new Set(parsedIds)]);
 
   return { projectCount: processedProjects, sessionCount: processedSessions };
 }

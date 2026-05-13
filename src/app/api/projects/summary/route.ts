@@ -1,4 +1,4 @@
-import { gte } from 'drizzle-orm';
+import { count, gte } from 'drizzle-orm';
 import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { toStage } from '@/lib/observatory/normalize';
@@ -19,6 +19,15 @@ export async function GET() {
       .from(sessions)
       .where(gte(sessions.startedAt, since))
       .all();
+    const sessionCounts = db
+      .select({
+        projectId: sessions.projectId,
+        sessionCount: count(sessions.id),
+      })
+      .from(sessions)
+      .groupBy(sessions.projectId)
+      .all();
+    const sessionCountMap = new Map(sessionCounts.map((row) => [row.projectId, row.sessionCount]));
 
     const byProject = new Map<
       string,
@@ -57,7 +66,7 @@ export async function GET() {
       byProject.set(session.projectId, current);
     }
 
-    const result: ProjectSummary[] = allProjects.map((project) => {
+    const result: ProjectSummary[] = allProjects.filter((project) => sessionCountMap.has(project.id)).map((project) => {
       const stats = byProject.get(project.id);
       const runnerTotal = (stats?.claude ?? 0) + (stats?.codex ?? 0);
 

@@ -14,10 +14,12 @@ import { join } from 'path';
 import { homedir } from 'os';
 import { createInterface } from 'readline';
 import { createHash } from 'crypto';
+import { and, eq, inArray, notInArray } from 'drizzle-orm';
 import { db } from '../db';
-import { projects, sessions } from '../schema';
+import { codeAuthorship, decisions, projects, sessions } from '../schema';
 import { inferStage } from './stage-inferrer';
 import { calculateCost } from '../pricing';
+import { normalizeProjectPath } from './project-path';
 
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions');
 const MAX_SESSION_SECS = 4 * 3600;
@@ -45,6 +47,37 @@ interface CodexSession {
   tokensOut: number;           // output_tokens + reasoning_output_tokens（reasoning 按 output 价格计）
 }
 
+function isGuardianSessionMeta(payload: Record<string, unknown>): boolean {
+  const source = payload.source;
+  if (typeof source !== 'object' || source === null) return false;
+
+  const subagent = (source as { subagent?: unknown }).subagent;
+  if (typeof subagent !== 'object' || subagent === null) return false;
+
+  return (subagent as { other?: unknown }).other === 'guardian';
+}
+
+function deleteStaleCodexSessions(parsedIds: string[]) {
+  const staleRows = parsedIds.length > 0
+    ? db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(and(eq(sessions.source, 'codex'), notInArray(sessions.id, parsedIds)))
+      .all()
+    : db
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(eq(sessions.source, 'codex'))
+      .all();
+
+  const staleIds = staleRows.map((row) => row.id);
+  if (staleIds.length === 0) return;
+
+  db.delete(decisions).where(inArray(decisions.sessionId, staleIds)).run();
+  db.delete(codeAuthorship).where(inArray(codeAuthorship.sessionId, staleIds)).run();
+  db.delete(sessions).where(inArray(sessions.id, staleIds)).run();
+}
+
 async function parseCodexJsonl(filePath: string): Promise<CodexSession | null> {
   const result: CodexSession = {
     id: '',
@@ -66,6 +99,7 @@ async function parseCodexJsonl(filePath: string): Promise<CodexSession | null> {
   let lastTotalCached = 0;
   let lastTotalOutput = 0;
   let lastTotalReasoning = 0;
+  let skip = false;
 
   await new Promise<void>((resolve) => {
     const rl = createInterface({
@@ -79,6 +113,7 @@ async function parseCodexJsonl(filePath: string): Promise<CodexSession | null> {
         const obj = JSON.parse(line);
         const payload = obj.payload;
         if (!payload) return;
+        if (skip) return;
 
         // Track timestamps
         if (obj.timestamp) {
@@ -92,8 +127,12 @@ async function parseCodexJsonl(filePath: string): Promise<CodexSession | null> {
         // session_meta → project info
         // codex format: { type: "session_meta", payload: { id, cwd, git, ... } }
         if (obj.type === 'session_meta' && payload) {
+          if (isGuardianSessionMeta(payload)) {
+            skip = true;
+            return;
+          }
           result.id = payload.id ?? '';
-          result.projectPath = payload.cwd ?? '';
+          result.projectPath = payload.cwd ? normalizeProjectPath(payload.cwd) : '';
           if (payload.git?.branch) {
             result.gitBranch = payload.git.branch;
           }
@@ -135,6 +174,7 @@ async function parseCodexJsonl(filePath: string): Promise<CodexSession | null> {
     rl.on('error', () => resolve());
   });
 
+  if (skip) return null;
   if (!result.id || !result.projectPath) return null;
 
   result.summary = lastAssistantText.slice(0, 2000);
@@ -185,6 +225,9 @@ export async function ingestCodex(): Promise<{ projectCount: number; sessionCoun
       parsed.push(r.value);
     }
   }
+
+  const parsedIds = parsed.map((session) => session.id);
+  deleteStaleCodexSessions(parsedIds);
 
   // Group by project path
   const byProject = new Map<string, CodexSession[]>();
